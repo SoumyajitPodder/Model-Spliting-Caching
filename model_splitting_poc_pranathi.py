@@ -12,6 +12,7 @@ ATOL = 1e-5
 RTOL = 1e-4
 
 
+
 def _normalize_hidden(hidden):
     if hidden.dim() == 2:
         return hidden.unsqueeze(0)
@@ -337,7 +338,7 @@ if __name__ == "__main__":
 
     print_layer_metrics(full_layer_outputs, split_layer_outputs, len(model.model.layers))
     print_generation_metrics(tokenizer, full_logits, split_logits)
-    
+
 """
 VALIDATION STRATEGY: Hidden State Equivalence
 --------------------------------------------------------------------------------
