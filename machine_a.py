@@ -1,4 +1,10 @@
-from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache, DynamicLayer
+# ============================================================
+# IMPORTS / GLOBAL CONFIG
+# ============================================================
+
+from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache, DynamicLayer, AutoConfig
+from accelerate import init_empty_weights
+from safetensors.torch import load_file
 import torch
 import time
 import os
@@ -6,35 +12,60 @@ import socket
 import psutil
 import io 
 
-model_path = "./llama-3b"
-device = "cpu"
-tokenizer = AutoTokenizer.from_pretrained(model_path)
-stopping_layer = 14
-starting_layer = stopping_layer + 1
-tokens_to_generate = 50
+# ============================================================
+# MODEL LOADING / INITIALIZATION
+# ============================================================
 
-model = AutoModelForCausalLM.from_pretrained(
-    model_path,
-    torch_dtype=torch.bfloat16,
-    device_map={"": "cpu"}
-)
-
-# KEEP ONLY FIRST HALF
-model.model.layers = torch.nn.ModuleList(
-    model.model.layers[:14]
-)
-
-model.eval()
-
-# Prompt setup lives on Machine A — it drives the generation loop
-messages = [{"role": "user", "content": "hello world"}]
-prompt = tokenizer.apply_chat_template(
-    messages,
-    tokenize=False,
-    add_generation_prompt=True
-)
-inputs = tokenizer(prompt, return_tensors="pt")
 captured = {}
+
+def setup_model(stopping_layer:int, model_path):
+    start = time.time()
+    print(torch.cuda.get_arch_list())
+    model_path = model_path
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    config = AutoConfig.from_pretrained(model_path)
+
+    config.num_hidden_layers = stopping_layer
+
+    with init_empty_weights():
+        model = AutoModelForCausalLM.from_config(config)
+
+    state_a = {}
+
+    state_a.update(load_file(f"./layers/embed_tokens.safetensors", device=device))
+    for i in range(stopping_layer):
+        state_a.update(load_file(f"./layers/layer_{i}.safetensors", device=device))
+        print(f"Loaded layer {i}")
+
+    model.load_state_dict(
+        state_a,
+        strict=False,
+        assign=True
+    )
+
+    model.eval()
+
+    # Prompt setup lives on Machine A — it drives the generation loop
+    messages = [{"role": "user", "content": "hello world"}]
+    prompt = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True
+    )
+
+    inputs = tokenizer(prompt, return_tensors="pt").to(device)
+
+    print(f"Load time: {time.time() - start:.2f}s")
+    print("Machine A ready")
+
+    return model, inputs, tokenizer
+
+# ============================================================
+# MESSAGE PROTOCOL / SOCKET COMMUNICATION
+# ============================================================
+
 TAILSCALE_PORT = 65432
 
 MSG_FIRST_PASS = 1
@@ -83,6 +114,20 @@ def read_TCP_data(conn, length):
         # add packet binaries to data
     return data
 
+def send_to_machine_b(conn, filepath):
+    with open(filepath, "rb") as f:
+        # Open file in binary read mode
+        # tensor files contain raw serialized bytes so text would corrupt the data
+        data = f.read()
+        # load file into memory
+    conn.sendall(len(data).to_bytes(8, byteorder="big"))
+    # len(data).tobytes(8) = let the first 8 bytes = the file length
+    # byteorder = big = send the most siginificant byte first
+    # we are telling the receiver how much data is coming 
+    conn.sendall(data)
+    # sending the actual data
+    print(f"Sent {filepath} ({len(data)} bytes)")
+
 def setup_machine_a_conn():
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     # Create server socket
@@ -100,20 +145,9 @@ def setup_machine_a_conn():
     print(f"Machine B connected from {addr}")
     return server_socket, conn
 
-def send_to_machine_b(conn, filepath):
-    with open(filepath, "rb") as f:
-        # Open file in binary read mode
-        # tensor files contain raw serialized bytes so text would corrupt the data
-        data = f.read()
-        # load file into memory
-    conn.sendall(len(data).to_bytes(8, byteorder="big"))
-    # len(data).tobytes(8) = let the first 8 bytes = the file length
-    # byteorder = big = send the most siginificant byte first
-    # we are telling the receiver how much data is coming 
-    conn.sendall(data)
-    # sending the actual data
-    print(f"Sent {filepath} ({len(data)} bytes)")
-
+# ============================================================
+# VALIDATION / BENCHMARKING
+# ============================================================
 
 def get_system_stats(label):
     # CPU usage
@@ -136,6 +170,10 @@ def get_system_stats(label):
         print(f"GPU total:     {gpu_total:.2f} GB")
     else:
         print("GPU: not available")
+
+# ============================================================
+# FORWARD HOOK CAPTURE FUNCTIONS
+# ============================================================
 
 def hook_fn(module, input, output):
         hidden = output[0].detach()
@@ -160,6 +198,10 @@ def save_handoff_package(hidden, position_embeddings, position_ids, save_dir="./
 def save_hidden_only(hidden, save_dir="./handoff"):
     torch.save(hidden, f"{save_dir}/hidden.pt")
 
+# ============================================================
+# SPLIT EXECUTION (MACHINE A)
+# ============================================================
+
 def split_1(current_input_ids, cache_a=None):
     """
     ---- Machine A ----
@@ -181,7 +223,7 @@ def split_1(current_input_ids, cache_a=None):
 
     return hidden, position_embeddings, position_ids, cache_a
 
-def run_machine_a(tokens_to_generate, conn):
+def run_machine_a(tokens_to_generate, stopping_layer, tokenizer, conn):
     generated_token_ids = []
     
     current_input_ids = inputs["input_ids"]
@@ -231,20 +273,33 @@ def run_machine_a(tokens_to_generate, conn):
             print("receiving token")
             next_token_id = torch.load(io.BytesIO(payload))
             generated_token_ids.append(next_token_id.item())
-            current_input_ids = torch.cat([current_input_ids, next_token_id.unsqueeze(0)], dim=-1)
+            current_input_ids = torch.cat([current_input_ids, next_token_id.unsqueeze(0).to(current_input_ids.device)], dim=-1)
             token_count += 1
             print(token_count)
 
     h1.remove()
     h2.remove()
     response = tokenizer.decode(generated_token_ids, skip_special_tokens=True)
+
     return response
 
+
+# ============================================================
+# MAIN ENTRYPOINT
+# ============================================================
+
+
 if __name__ == "__main__":
+
+    stopping_layer = 14
+    model_path = "./llama-3b"
+    tokens_to_generate = 50
+
     server_socket, conn = setup_machine_a_conn()
+    model, inputs, tokenizer = setup_model(stopping_layer, model_path)
     try:
-        result = run_machine_a(tokens_to_generate, conn)
-        print("Response:", result)
+        response = run_machine_a(tokens_to_generate, stopping_layer, tokenizer, conn)
+        print("Response:", response)
     finally:
         conn.close()
         server_socket.close()

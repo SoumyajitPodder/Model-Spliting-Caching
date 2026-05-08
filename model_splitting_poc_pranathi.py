@@ -337,6 +337,7 @@ if __name__ == "__main__":
 
     print_layer_metrics(full_layer_outputs, split_layer_outputs, len(model.model.layers))
     print_generation_metrics(tokenizer, full_logits, split_logits)
+    
 """
 VALIDATION STRATEGY: Hidden State Equivalence
 --------------------------------------------------------------------------------

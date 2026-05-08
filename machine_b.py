@@ -1,31 +1,54 @@
-from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache, DynamicLayer
-from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache, DynamicLayer
+from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache, DynamicLayer, AutoConfig
+from accelerate import init_empty_weights
+from safetensors.torch import load_file
+import torch.nn as nn
 import torch
 import time
 import os
+import socket 
 import psutil
-import socket
-import io
+import io 
 
-model_path = "./llama-3b"
-device = "cpu"
-tokenizer = AutoTokenizer.from_pretrained(model_path)
-stopping_layer = 14
-starting_layer = stopping_layer + 1
-tokens_to_generate = 200
-first_pass = True 
 
-model = AutoModelForCausalLM.from_pretrained(
-    model_path,
-    torch_dtype=torch.bfloat16,
-    device_map={"": "cpu"}
-)
+def setup_model(stopping_layer:int, model_path):
+    start = time.time()
+    starting_layer = stopping_layer + 1
 
-model.model.layers = torch.nn.ModuleList(
-    model.model.layers[14:]
-)
+    model_path = model_path
 
-model.eval()
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    config = AutoConfig.from_pretrained(model_path)
+    original_total_layers = config.num_hidden_layers 
+
+    with init_empty_weights():
+        model = AutoModelForCausalLM.from_config(config)
+
+    state_b = {}
+
+    for i in range(starting_layer, original_total_layers):
+        state_b.update(load_file(f"./layers/layer_{i}.safetensors", device=device))
+        print(f"Loaded layer {i}")
+
+    state_b.update(load_file(f"./layers/norm.safetensors", device=device))
+    state_b.update(load_file(f"./layers/head.safetensors", device=device))
+
+    model.load_state_dict(
+        state_b,
+        strict=False,
+        assign=True
+    )
+
+    kept_layers = model.model.layers[starting_layer:]
+    model.model.layers = nn.ModuleList(kept_layers)
+
+    model.eval()
+
+    print(f"Load time: {time.time() - start:.2f}s")
+    print("Machine B ready")
+
+    return model, tokenizer
+
 
 MACHINE_A_TAILSCALE_IP = "100.74.100.92"  
 TAILSCALE_PORT = 65432
@@ -112,8 +135,6 @@ def receive_file(conn, save_path):
     # read exactly the first 8 bytes which contain the file size
     # int.from_bytes = turn bytes back into numbers
 
-    print(f"Receiving {length} bytes...")
-    
     data = read_TCP_data(conn, length)
     # read the payload
     
@@ -121,7 +142,7 @@ def receive_file(conn, save_path):
     # open destination file in binary write mode
         f.write(data)
         # write the data
-    print(f"File saved to {save_path}")
+    print(f"File saved to {save_path},({length}) bytes...")
 
 def get_system_stats(label):
     # CPU usage
@@ -146,13 +167,7 @@ def get_system_stats(label):
         print("GPU: not available")
 
 def load_handoff_package(save_dir="./received", first_pass=True):
-    device = "cpu"
-    """
-    if torch.cuda.is_available():
-        device = "cuda"
-    else:
-        device = "cpu"
-    """
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     if first_pass:
         hidden = torch.load(f"{save_dir}/hidden.pt", map_location=device)
         cos = torch.load(f"{save_dir}/cos.pt", map_location=device)
@@ -196,8 +211,8 @@ def split_2(hidden, position_embeddings, position_ids, cache_b=None):
 
     return  next_token_id, cache_b
 
-def run_machine_b(tokens_to_generate):
-    
+def run_machine_b(conn):
+
     cache_b = None
     position_embeddings = None
     position_ids = None
@@ -225,10 +240,6 @@ def run_machine_b(tokens_to_generate):
             receive_msg_file(conn, MSG_NEXT_PASS,"./received/cos.pt")
             hidden, position_embeddings, position_ids = load_handoff_package()
 
-        print(f"hidden device: {hidden.device}")
-        print(f"position_ids device: {position_ids.device}")
-        print(f"cos device: {position_embeddings[0].device}")
-        print(f"sin device: {position_embeddings[1].device}")
 
         print("Starting Split 2")
         next_token_id, cache_b = split_2(hidden, position_embeddings, position_ids, cache_b)
@@ -253,8 +264,14 @@ def run_machine_b(tokens_to_generate):
     return
 
 
+
 if __name__ == "__main__":
+
+    stopping_layer = 14
+    model_path = "./llama-3b"
+
     conn = setup_machine_b()
+    model, tokenizer = setup_model(stopping_layer, model_path)
     try:
         run_machine_b(conn)
     finally:
