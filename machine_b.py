@@ -8,15 +8,28 @@ import os
 import socket 
 import psutil
 import io 
+import struct
+from config import (
+    MODEL_PATH,
+    STOPPING_LAYER,
+    DEVICE,
+    MACHINE_A_TAILSCALE_IP,
+    TAILSCALE_PORT,
+    MSG_FIRST_PASS,
+    MSG_NEXT_PASS,
+    MSG_TOKEN,
+    MSG_EOS,
+    MSG_LAYER,
+    MSG_TTFT,
+    RECEIVED_DIR
+)
 
 
-def setup_model(stopping_layer:int, model_path):
+def setup_model_b(stopping_layer:int, model_path):
     start = time.time()
-    starting_layer = stopping_layer + 1
 
     model_path = model_path
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     config = AutoConfig.from_pretrained(model_path)
     original_total_layers = config.num_hidden_layers 
@@ -24,23 +37,29 @@ def setup_model(stopping_layer:int, model_path):
     with init_empty_weights():
         model = AutoModelForCausalLM.from_config(config)
 
+    model_name = os.path.basename(model_path)
+    layers_dir = f"./layers/{model_name}"
     state_b = {}
 
-    for i in range(starting_layer, original_total_layers):
-        state_b.update(load_file(f"./layers/layer_{i}.safetensors", device=device))
+    for i in range(stopping_layer, original_total_layers):
+        state_b.update(load_file(f"{layers_dir}/layer_{i}.safetensors", device=DEVICE))
         print(f"Loaded layer {i}")
 
-    state_b.update(load_file(f"./layers/norm.safetensors", device=device))
-    state_b.update(load_file(f"./layers/head.safetensors", device=device))
+    state_b.update(load_file(f"{layers_dir}/norm.safetensors", device=DEVICE))
+    state_b.update(load_file(f"{layers_dir}/head.safetensors", device=DEVICE))
 
     model.load_state_dict(
         state_b,
         strict=False,
         assign=True
     )
+    
 
-    kept_layers = model.model.layers[starting_layer:]
+    kept_layers = model.model.layers[stopping_layer:]
     model.model.layers = nn.ModuleList(kept_layers)
+    
+    for i, layer in enumerate(model.model.layers):
+        print(i, layer.input_layernorm.weight.device)
 
     model.eval()
 
@@ -49,14 +68,47 @@ def setup_model(stopping_layer:int, model_path):
 
     return model, tokenizer
 
+# ============================================================
+# MESSAGE PROTOCOL / SOCKET COMMUNICATION
+# ============================================================
 
-MACHINE_A_TAILSCALE_IP = "100.74.100.92"  
-TAILSCALE_PORT = 65432
+def receive_ttft(conn):
+    """
+    Receive TTFT from Machine A
+    """
 
-MSG_FIRST_PASS = 1
-MSG_NEXT_PASS = 2
-MSG_TOKEN = 3
-MSG_EOS = 4
+    msg_type = read_TCP_data(conn, 1)[0]
+
+    if msg_type != MSG_TTFT:
+        raise ValueError(f"Expected MSG_TTFT, got {msg_type}")
+
+    length = int.from_bytes(read_TCP_data(conn, 8), "big")
+
+    payload = read_TCP_data(conn, length)
+
+    ttft = struct.unpack(">d", payload)[0]
+
+    print(f"Received TTFT from Machine A: {ttft:.4f}s")
+
+    return ttft
+
+def send_layers(conn, layers):
+    buffer = io.BytesIO()
+    torch.save(layers, buffer)
+    payload = buffer.getvalue()
+    conn.sendall(MSG_LAYER.to_bytes(1, byteorder="big"))
+    conn.sendall(len(payload).to_bytes(8, byteorder="big"))
+    conn.sendall(payload)
+    print(f"Layers sent to Machine A")
+
+def receive_layers(conn):
+    msg_type, payload = read_message(conn)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    if msg_type != MSG_LAYER:
+        raise ValueError(
+            f"Expected MSG_LAYER, got {msg_type}"
+        )
+    return torch.load(io.BytesIO(payload), map_location=DEVICE)
 
 def send_token(conn, token):
     buffer = io.BytesIO()
@@ -111,7 +163,7 @@ def read_TCP_data(conn, length):
         # add packet binaries to data
     return data
 
-def setup_machine_b(retries=20, delay=3):
+def setup_machine_b_conn(retries=20, delay=3):
     print(f"Machine B connecting to {MACHINE_A_TAILSCALE_IP}:{TAILSCALE_PORT}")
     for attempt in range(1, retries + 1):
         try:
@@ -144,6 +196,10 @@ def receive_file(conn, save_path):
         # write the data
     print(f"File saved to {save_path},({length}) bytes...")
 
+# ============================================================
+# VALIDATION / BENCHMARKING
+# ============================================================
+
 def get_system_stats(label):
     # CPU usage
     cpu_percent = psutil.cpu_percent(interval=0.1)
@@ -166,20 +222,23 @@ def get_system_stats(label):
     else:
         print("GPU: not available")
 
-def load_handoff_package(save_dir="./received", first_pass=True):
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+def load_handoff_package(save_dir=RECEIVED_DIR, first_pass=True):
     if first_pass:
-        hidden = torch.load(f"{save_dir}/hidden.pt", map_location=device)
-        cos = torch.load(f"{save_dir}/cos.pt", map_location=device)
-        sin = torch.load(f"{save_dir}/sin.pt", map_location=device)
+        hidden = torch.load(f"{save_dir}/hidden.pt", map_location=DEVICE)
+        cos = torch.load(f"{save_dir}/cos.pt", map_location=DEVICE)
+        sin = torch.load(f"{save_dir}/sin.pt", map_location=DEVICE)
         position_embeddings = (cos, sin)
-        position_ids = torch.load(f"{save_dir}/position_ids.pt", map_location=device)
+        position_ids = torch.load(f"{save_dir}/position_ids.pt", map_location=DEVICE)
         return hidden, position_embeddings, position_ids
     else:
-        hidden = torch.load(f"{save_dir}/hidden.pt", map_location=device)
+        hidden = torch.load(f"{save_dir}/hidden.pt", map_location=DEVICE)
         return hidden
 
-def split_2(hidden, position_embeddings, position_ids, cache_b=None):
+# ============================================================
+# SPLIT EXECUTION (MACHINE B)
+# ============================================================
+
+def split_2(hidden, position_embeddings, position_ids, model, cache_b=None):
     """
     ---- Machine B ----
     Second Split 
@@ -211,38 +270,69 @@ def split_2(hidden, position_embeddings, position_ids, cache_b=None):
 
     return  next_token_id, cache_b
 
-def run_machine_b(conn):
 
+def run_machine_b(tokenizer, model, stopping_layer, conn):
+    generated_token_ids = []
     cache_b = None
     position_embeddings = None
     position_ids = None
     first_pass = True
     token_count = 0 
     eos_detected = False
+
+    layer_outputs_b = {}
+    layer_times_b   = {}
+
+    def make_validation_hook(idx):
+        original_idx = idx + stopping_layer
+        def hook_fn_validation(module, input, output):
+            t = time.time()
+            hidden = output[0].detach().clone()
+            if hidden.dim() == 2:
+                hidden = hidden.unsqueeze(0)
+            layer_outputs_b[original_idx] = hidden
+            layer_times_b[original_idx]   = time.time() - t
+        return hook_fn_validation
+
+    # Register validation hooks on all layers
+    validation_hooks = []
+    for i in range(len(model.model.layers)):
+        print(f"hook registered to layer {i + stopping_layer}")
+        validation_hooks.append(
+            model.model.layers[i].register_forward_hook(make_validation_hook(i))
+        )
+    
     while True:
-        
         if first_pass:
+
+            #for idx, tensor in layer_outputs_b.items():
+                #print(f"Layer {idx} shape after first pass removal: {tensor.shape}")
+            
             print("Machine B first pass")
-            os.makedirs("./received", exist_ok=True)
-            receive_msg_file(conn, MSG_FIRST_PASS,"./received/hidden.pt")
-            receive_msg_file(conn, MSG_FIRST_PASS,"./received/sin.pt")
-            receive_msg_file(conn, MSG_FIRST_PASS,"./received/position_ids.pt")
-            receive_msg_file(conn, MSG_FIRST_PASS,"./received/cos.pt")
+            os.makedirs(RECEIVED_DIR, exist_ok=True)
+            receive_msg_file(conn, MSG_FIRST_PASS, f"{RECEIVED_DIR}/hidden.pt")
+            receive_msg_file(conn, MSG_FIRST_PASS, f"{RECEIVED_DIR}/sin.pt")
+            receive_msg_file(conn, MSG_FIRST_PASS, f"{RECEIVED_DIR}/position_ids.pt")
+            receive_msg_file(conn, MSG_FIRST_PASS, f"{RECEIVED_DIR}/cos.pt")
 
             hidden, position_embeddings, position_ids = load_handoff_package(first_pass=first_pass)
             first_pass = False
             #load file into memory
 
         else:
-            receive_msg_file(conn, MSG_NEXT_PASS,"./received/hidden.pt")
-            receive_msg_file(conn, MSG_NEXT_PASS,"./received/sin.pt")
-            receive_msg_file(conn, MSG_NEXT_PASS,"./received/position_ids.pt")
-            receive_msg_file(conn, MSG_NEXT_PASS,"./received/cos.pt")
+            receive_msg_file(conn, MSG_NEXT_PASS, f"{RECEIVED_DIR}/hidden.pt")
+            receive_msg_file(conn, MSG_NEXT_PASS, f"{RECEIVED_DIR}/sin.pt")
+            receive_msg_file(conn, MSG_NEXT_PASS, f"{RECEIVED_DIR}/position_ids.pt")
+            receive_msg_file(conn, MSG_NEXT_PASS, f"{RECEIVED_DIR}/cos.pt")
             hidden, position_embeddings, position_ids = load_handoff_package()
 
 
         print("Starting Split 2")
-        next_token_id, cache_b = split_2(hidden, position_embeddings, position_ids, cache_b)
+        next_token_id, cache_b = split_2(hidden, position_embeddings, position_ids, model, cache_b)
+        print(hidden.dtype, hidden.device)
+        for h in validation_hooks:
+                h.remove()
+        validation_hooks = []
         #perform split 2 and generate the next token
 
         # ---- Check if model is done ----
@@ -258,21 +348,35 @@ def run_machine_b(conn):
             break
         else:
             print("sending token")
+            generated_token_ids.append(next_token_id.item())
             send_token(conn, next_token_id)
 
+    print(f"layer_outputs_b keys before send: {sorted(layer_outputs_b.keys())}")
+    print(f"layer_outputs_b length: {len(layer_outputs_b)}")
+
+    print("Receiving Machine A layer outputs...")
+    machine_a_layer_outputs = receive_layers(conn)
+
+    print("Sending Machine B layer outputs to Machine A...")
+    send_layers(conn, layer_outputs_b)
+
+    all_layer_outputs = {**machine_a_layer_outputs, **layer_outputs_b}
+    print(len(all_layer_outputs))
+
+    ttft = receive_ttft(conn)
+    response = tokenizer.decode(generated_token_ids, skip_special_tokens=True)
     get_system_stats("==================== SPLIT GEN STATS ============================")
-    return
+    return response, all_layer_outputs, ttft
 
-
+# ============================================================
+# MAIN ENTRYPOINT
+# ============================================================
 
 if __name__ == "__main__":
-
-    stopping_layer = 14
-    model_path = "./llama-3b"
-
-    conn = setup_machine_b()
-    model, tokenizer = setup_model(stopping_layer, model_path)
+    conn = setup_machine_b_conn()
+    model, tokenizer = setup_model_b(STOPPING_LAYER, MODEL_PATH)
     try:
-        run_machine_b(conn)
+        response, all_layer_outputs, ttft = run_machine_b(tokenizer, model, STOPPING_LAYER, conn)
+        print("response:", response)
     finally:
         conn.close()
