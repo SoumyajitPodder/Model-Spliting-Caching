@@ -53,11 +53,11 @@ class ResourceMonitor:
             "gpu_peak_gb": max(gpus),
         }
     
-def validate_all_layers(full_outputs, split_outputs, cos_threshold=0.99, tolerance=1e-2):
+def validate_all_layers(full_outputs, split_outputs, full_model, split_model, cos_threshold=0.99, tolerance=1e-2):
     cos_sim_fn = torch.nn.CosineSimilarity(dim=-1)
 
     print(f"\n{'='*65}")
-    print("LAYER VALIDATION — Full vs Split (all 28 layers)")
+    print(f"LAYER VALIDATION: MACHINE B  — Full ({len(full_model.model.layers)} Layers) vs Split ({len(split_model.model.layers)} Layers)")
     print(f"{'='*65}")
     print(f"{'Layer':<8} {'Mean Diff':<14} {'Cos Sim':<12} {'Match'}")
     print(f"{'-'*65}")
@@ -96,7 +96,7 @@ if __name__ == "__main__":
     split_monitor = ResourceMonitor()
     split_monitor.start()
     split_start = time.time()
-    split_response, all_layer_outputs, split_ttft = machine_b.run_machine_b(tokenizer, model, STOPPING_LAYER, conn)
+    split_response, all_layer_outputs, split_ttft = machine_b.run_machine_b(tokenizer, model, STOPPING_LAYER, TOKENS_TO_GENERATE, conn)
     split_time  = time.time() - split_start
     split_monitor.stop()
     split_stats = split_monitor.summary()
@@ -109,28 +109,35 @@ if __name__ == "__main__":
     full_result = generation.default_generation(MODEL_PATH, PROMPT, STOPPING_LAYER, TOKENS_TO_GENERATE)
     full_ttft = full_result["ttft"]
     full_response = full_result["response"]
+    full_model = full_result["model"]
     full_time   = time.time() - full_start
     full_monitor.stop()
     full_stats  = full_monitor.summary()
 
     # ---- Validate ----
-    validate_all_layers(full_result["layer_outputs"], all_layer_outputs)
+    validate_all_layers(full_result["layer_outputs"], all_layer_outputs,full_model, model)
 
     # ---- Response Comparison ----
     
     print(f"\n{'='*55}")
-    print("RESOURCE COMPARISON")
+    print("RESPONSE COMPARISON: MACHINE B")
     print(f"{'='*55}")
-    print(f"Split Response: {split_response}")
+    print(f"MODEL: {os.path.basename(MODEL_PATH)}")
+    print(f"Split ({len(model.model.layers)} Layers) Query: {PROMPT}")
+    print(f"Split ({len(model.model.layers)} Layers) Response: {split_response}")
     print(f"{'-'*55}")
-    print(f"Full Response: {full_response}")
+    print(f"MODEL: {os.path.basename(MODEL_PATH)}")
+    print(f"Full ({len(full_model.model.layers)} Layers) Query: {PROMPT}")
+    print(f"Full ({len(full_model.model.layers)} Layers) Response: {full_response}")
     print(f"{'-'*55}")
 
     # ---- Resource comparison ----
+    full_model_layers = len(full_model.model.layers)
+    split_model_layers = len(model.model.layers)
     print(f"\n{'='*55}")
-    print("RESOURCE COMPARISON")
+    print("RESOURCE COMPARISON: MACHINE B")
     print(f"{'='*55}")
-    print(f"{'Metric':<25} {'Full':<15} {'Split':<15}")
+    print(f"{'Metric':<25} {'Full (' + str(full_model_layers) + ' Layers)':<15} {'Split (' + str(split_model_layers) + ' Layers)':<15}")
     print(f"{'-'*55}")
     print(f"{'Time (s)':<25} {full_time:<15.2f} {split_time:<15.2f}")
     print(f"{'Time to First Token (s)':<25} {full_ttft:<15.2f} {split_ttft:<15.2f}")

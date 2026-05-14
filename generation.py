@@ -6,6 +6,7 @@ import threading
 import os
 from config import (
     MODEL_PATH,
+    DTYPE,
     PROMPT,
     STOPPING_LAYER,
     TOKENS_TO_GENERATE,
@@ -80,6 +81,7 @@ def capture_layers(model, inputs, label, stopping_layer):
     # Run one forward pass to populate everything
     with torch.no_grad():
         model(**inputs)
+        
 
     # Remove all hooks
     for h in hooks:
@@ -113,7 +115,8 @@ def capture_layers(model, inputs, label, stopping_layer):
 def default_generation(model_path, prompt, stopping_layer, tokens_to_generate):
     model = AutoModelForCausalLM.from_pretrained(
         model_path, 
-        device_map=DEVICE
+        device_map=DEVICE,
+        dtype=DTYPE,
         )
     
     tokenizer = AutoTokenizer.from_pretrained(model_path)
@@ -140,7 +143,8 @@ def default_generation(model_path, prompt, stopping_layer, tokens_to_generate):
         output_ids = model.generate(
             **inputs,
             max_new_tokens=tokens_to_generate,
-            use_cache=True
+            use_cache=True,
+            do_sample=False
         )
     gen_time = time.time() - gen_start
 
@@ -156,6 +160,7 @@ def default_generation(model_path, prompt, stopping_layer, tokens_to_generate):
     print(f"Response: {output_response}")
 
     return {
+        "model": model,
         "response":       output_response,
         "layer_outputs":  layer_outputs,
         "handoff_package": handoff_package,

@@ -25,6 +25,7 @@ from config import (
     MSG_EOS,
     MSG_LAYER,
     MSG_TTFT,
+    MSG_STOP,
     HANDOFF_DIR
 )
 
@@ -73,14 +74,18 @@ def setup_model_a(stopping_layer:int, model_path, prompt):
 
     inputs = tokenizer(prompt, return_tensors="pt").to(DEVICE)
 
-    print(f"Load time: {time.time() - start:.2f}s")
-    print("Machine A ready")
+    print(f"Load time: {time.time() - start:.2f}s \n")
+    print("Machine A ready \n")
 
     return model, inputs, tokenizer
 
 # ============================================================
 # MESSAGE PROTOCOL / SOCKET COMMUNICATION
 # ============================================================
+
+def send_stop(conn):
+    conn.sendall(bytes([MSG_STOP]))
+    print("Sent STOP signal to Machine B")
 
 def send_ttft(conn, ttft):
     """
@@ -255,7 +260,9 @@ def split_1(current_input_ids, model, cache_a=None):
             model(input_ids=current_input_ids,
                 past_key_values=cache_a,
                 use_cache=True,
-                return_dict=True)
+                return_dict=True,
+                do_sample=False
+                )
     except StopIteration:
         pass
     hidden = captured["hidden"]
@@ -298,6 +305,7 @@ def run_machine_a(tokens_to_generate, stopping_layer, tokenizer, inputs, model, 
     # Register validation hooks on all layers
     validation_hooks = []
     for i in range(len(model.model.layers)):
+        print(f"hook registered to layer {i}")
         validation_hooks.append(
             model.model.layers[i].register_forward_hook(make_validation_hook(i))
         )
@@ -309,7 +317,7 @@ def run_machine_a(tokens_to_generate, stopping_layer, tokenizer, inputs, model, 
 
     while token_count < tokens_to_generate:
         
-        print("Starting Split 1")
+        print(f"Starting Split 1: Pass #{token_count + 1}")
         hidden, position_embeddings, position_ids, cache_a = split_1(current_input_ids, model, cache_a)
         # perform split 1
         
@@ -328,7 +336,7 @@ def run_machine_a(tokens_to_generate, stopping_layer, tokenizer, inputs, model, 
             send_msg_file(conn, MSG_FIRST_PASS, f"{HANDOFF_DIR}/sin.pt")
             send_msg_file(conn, MSG_FIRST_PASS, f"{HANDOFF_DIR}/position_ids.pt")
             send_msg_file(conn, MSG_FIRST_PASS, f"{HANDOFF_DIR}/cos.pt")
-            print(hidden.dtype)
+            #print(hidden.dtype)
             first_pass = False
 
             #export captured["position_ids"], captured["position_embeddings"] and captured["hidden"]
@@ -362,12 +370,11 @@ def run_machine_a(tokens_to_generate, stopping_layer, tokenizer, inputs, model, 
             break
 
         if msg_type == MSG_TOKEN:
-            print("receiving token")
             next_token_id = torch.load(io.BytesIO(payload))
             generated_token_ids.append(next_token_id.item())
             current_input_ids = torch.cat([current_input_ids, next_token_id.unsqueeze(0).to(current_input_ids.device)], dim=-1)
             token_count += 1
-            print(token_count)
+            print(f"received token {token_count} \n")
 
     print("Sending Machine A layer outputs to Machine B...")
     send_layers(conn, layer_outputs)

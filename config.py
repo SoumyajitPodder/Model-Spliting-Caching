@@ -2,21 +2,22 @@ import torch
 import os
 
 # ================================================================
-# EVERYTHING BUT DEVICE, HANDOFF_DIR AND RECEIVED_DIR MUST BE SAME
+# EVERYTHING BUT DEVICE, HANDOFF_DIR, LAYERS_DIR AND RECEIVED_DIR MUST BE SAME
 # ACROSS MACHINE_A AND MACHINE_B
 # ================================================================
 
 # ================================================================
 # MODEL CONFIG
 # ================================================================
-MODEL_PATH     = "./llama-8b"
-STOPPING_LAYER = 16
+MODEL_PATH     = "./llama-3b"
+STOPPING_LAYER = 15
+DTYPE = torch.float16
 
 # ================================================================
 # GENERATION CONFIG
 # ================================================================
-PROMPT             = "Hello World"
-TOKENS_TO_GENERATE = 50
+PROMPT             = ("Name 3 key metrics every startup should track. Answer in one sentence")
+TOKENS_TO_GENERATE = 30
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # ================================================================
@@ -30,6 +31,7 @@ MSG_TOKEN      = 3
 MSG_EOS        = 4
 MSG_LAYER      = 5
 MSG_TTFT       = 6
+MSG_STOP       = 7
 
 ANIRUDH_MACHINE_A = "100.74.100.92"
 PRANATHI_MACHINE_A = ""

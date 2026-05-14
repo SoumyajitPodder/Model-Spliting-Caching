@@ -21,7 +21,10 @@ from config import (
     MSG_EOS,
     MSG_LAYER,
     MSG_TTFT,
+    MSG_STOP,
+    TOKENS_TO_GENERATE,
     RECEIVED_DIR
+    
 )
 
 
@@ -58,13 +61,13 @@ def setup_model_b(stopping_layer:int, model_path):
     kept_layers = model.model.layers[stopping_layer:]
     model.model.layers = nn.ModuleList(kept_layers)
     
-    for i, layer in enumerate(model.model.layers):
-        print(i, layer.input_layernorm.weight.device)
+    #for i, layer in enumerate(model.model.layers):
+        #print(i, layer.input_layernorm.weight.device)
 
     model.eval()
 
-    print(f"Load time: {time.time() - start:.2f}s")
-    print("Machine B ready")
+    print(f"Load time: {time.time() - start:.2f}s \n")
+    print("Machine B ready \n")
 
     return model, tokenizer
 
@@ -117,12 +120,12 @@ def send_token(conn, token):
     conn.sendall(MSG_TOKEN.to_bytes(1, byteorder="big"))
     conn.sendall(len(payload).to_bytes(8, byteorder="big"))
     conn.sendall(payload)
-    print(f"Token sent to Machine A")
+    #print(f"Token sent to Machine A")
 
 def send_eos(conn):
     conn.sendall(MSG_EOS.to_bytes(1, byteorder="big"))
     conn.sendall((0).to_bytes(8, byteorder="big"))
-    print("EOS sent to Machine A")
+    #print("EOS sent to Machine A")
 
 def receive_msg_file(conn, expected_msg_type, save_path):
     msg_type = read_TCP_data(conn, 1)[0]
@@ -271,7 +274,7 @@ def split_2(hidden, position_embeddings, position_ids, model, cache_b=None):
     return  next_token_id, cache_b
 
 
-def run_machine_b(tokenizer, model, stopping_layer, conn):
+def run_machine_b(tokenizer, model, stopping_layer, tokens_to_generate, conn):
     generated_token_ids = []
     cache_b = None
     position_embeddings = None
@@ -327,9 +330,9 @@ def run_machine_b(tokenizer, model, stopping_layer, conn):
             hidden, position_embeddings, position_ids = load_handoff_package()
 
 
-        print("Starting Split 2")
+        print(f"Starting Split 2: Pass #{token_count + 1}")
         next_token_id, cache_b = split_2(hidden, position_embeddings, position_ids, model, cache_b)
-        print(hidden.dtype, hidden.device)
+        #print(hidden.dtype, hidden.device)
         for h in validation_hooks:
                 h.remove()
         validation_hooks = []
@@ -343,16 +346,20 @@ def run_machine_b(tokenizer, model, stopping_layer, conn):
         if next_token_id.item() in eos_ids:
             # if we have detect eos/reached token count then we call machine A to start decoding the response by sending eos_detected = True
             eos_detected = True
-            print("sending eos")
             send_eos(conn)
+            print("Sent EOS Token")
             break
+
         else:
-            print("sending token")
             generated_token_ids.append(next_token_id.item())
             send_token(conn, next_token_id)
+            token_count += 1
+            print(f"Sent Token {token_count} \n")
+            if token_count >= tokens_to_generate:
+                break
 
-    print(f"layer_outputs_b keys before send: {sorted(layer_outputs_b.keys())}")
-    print(f"layer_outputs_b length: {len(layer_outputs_b)}")
+    #print(f"layer_outputs_b keys before send: {sorted(layer_outputs_b.keys())}")
+    #print(f"layer_outputs_b length: {len(layer_outputs_b)}")
 
     print("Receiving Machine A layer outputs...")
     machine_a_layer_outputs = receive_layers(conn)
@@ -365,7 +372,7 @@ def run_machine_b(tokenizer, model, stopping_layer, conn):
 
     ttft = receive_ttft(conn)
     response = tokenizer.decode(generated_token_ids, skip_special_tokens=True)
-    get_system_stats("==================== SPLIT GEN STATS ============================")
+    #get_system_stats("==================== SPLIT GEN STATS ============================")
     return response, all_layer_outputs, ttft
 
 # ============================================================
@@ -376,7 +383,7 @@ if __name__ == "__main__":
     conn = setup_machine_b_conn()
     model, tokenizer = setup_model_b(STOPPING_LAYER, MODEL_PATH)
     try:
-        response, all_layer_outputs, ttft = run_machine_b(tokenizer, model, STOPPING_LAYER, conn)
+        response, all_layer_outputs, ttft = run_machine_b(tokenizer, model, STOPPING_LAYER, TOKENS_TO_GENERATE, conn)
         print("response:", response)
     finally:
         conn.close()
