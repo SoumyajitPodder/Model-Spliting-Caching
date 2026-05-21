@@ -67,14 +67,14 @@ source .venv/bin/activate
 # Install dependencies
 
 ```bash
-pip install torch transformers accelerate safetensors psutil
+pip install -r requirements.txt
 ```
 
 ---
 
 # Model Setup
 
-Download a HuggingFace-compatible LLaMA model locally.
+Download a HuggingFace-compatible LLaMA model locally on both machines.
 
 Example:
 
@@ -112,7 +112,7 @@ The split architecture assumes both machines are operating on the exact same tra
 
 # Step 1 — Generate Layer Files
 
-Before running distributed inference, layer checkpoints must be extracted from the original downloaded model.
+Before running distributed inference, layer checkpoints must be extracted from the original downloaded model on both machines.
 
 Run:
 
@@ -141,6 +141,29 @@ layers/
 These files are used so each machine only loads its assigned transformer layers instead of the full model.
 
 ---
+
+---
+
+# Create dotenv file
+
+Both machines must:
+
+Have Tailscale installed
+Be logged into the same Tailscale account
+Be connected and visible to each other on the Tailscale network
+
+Machine A should be the stronger machine, since it will handle the larger portion of the model workload.
+
+Create a .env file in the project root directory:
+
+# Machine A (stronger machine) Tailscale IP
+MACHINE_A_TAILSCALE_IP=100.xx.xx.xx
+
+You can find the Tailscale IP by running:
+
+tailscale ip -4
+
+on Machine A.
 
 # Distributed Execution Flow
 
@@ -215,7 +238,8 @@ Run the correct validation script depending on which machine you are using.
 On Machine A run:
 
 ```bash
-python validation_a.py
+python validation_a.py #for validation + metrics collection
+python machine_a # for standard distributed inference
 ```
 
 Machine A:
@@ -224,6 +248,8 @@ Machine A:
 * performs Split 1
 * sends hidden states
 * receives generated tokens
+* performs single machine generation of the same prompt to compare stats
+if we use validation mode
 
 ---
 
@@ -232,7 +258,8 @@ Machine A:
 On Machine B run:
 
 ```bash
-python validation_b.py
+python validation_b.py #for validation + metrics collection
+python machine_b.py # for standard distributed inference
 ```
 
 Machine B:
@@ -241,6 +268,8 @@ Machine B:
 * performs Split 2
 * generates next-token logits
 * sends tokens back
+* performs single machine generation of the same prompt to compare stats
+if we use validation mode
 
 ---
 

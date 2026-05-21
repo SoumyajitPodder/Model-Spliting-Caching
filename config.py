@@ -1,5 +1,8 @@
 import torch
 import os
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # ================================================================
 # EVERYTHING BUT DEVICE, HANDOFF_DIR, LAYERS_DIR AND RECEIVED_DIR MUST BE SAME
@@ -16,14 +19,14 @@ DTYPE = torch.float16
 # ================================================================
 # GENERATION CONFIG
 # ================================================================
-PROMPT             = ("Name 3 key metrics every startup should track. Answer in one sentence")
+PROMPT             = ("hello world")
 TOKENS_TO_GENERATE = 30
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # ================================================================
 # NETWORK CONFIG 
 # ================================================================
-MACHINE_A_TAILSCALE_IP = "100.74.100.92" 
+MACHINE_A_TAILSCALE_IP = os.getenv("MACHINE_A_TAILSCALE_IP")
 TAILSCALE_PORT         = 65432
 MSG_FIRST_PASS = 1
 MSG_NEXT_PASS  = 2
